@@ -1,5 +1,7 @@
 # Alpha Private Speaker Connector - Home Assistant Integration
 
+![Logo](https://github.com/VGCH/alpha-private-speaker-connector/blob/main/icons/dark_logo.png)
+
 Коннектор для локальных умных колонок Alpha от CYBEREX TECH для Home Assistant с полной приватностью.
 
 ## Возможности
