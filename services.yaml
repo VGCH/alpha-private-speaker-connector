@@ -1,0 +1,68 @@
+send_tts:
+  name: Send TTS to speaker
+  description: Send text-to-speech to Alpha speaker
+  fields:
+    speaker_id:
+      name: Speaker ID
+      description: ID of the Alpha speaker
+      required: true
+      example: "alpha_speaker_1"
+      selector:
+        text:
+    text:
+      name: Text
+      description: Text to speak
+      required: true
+      example: "Hello, this is a test"
+      selector:
+        text:
+    language:
+      name: Language
+      description: Language of the text
+      default: "ru"
+      selector:
+        text:
+    voice:
+      name: Voice
+      description: Voice to use
+      default: "default"
+      selector:
+        text:
+    volume:
+      name: Volume
+      description: Volume level (0-100)
+      default: 80
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: "%"
+    priority:
+      name: Priority
+      description: Priority playback
+      default: false
+      selector:
+        boolean:
+
+reload_speakers:
+  name: Reload speakers
+  description: Reload the list of Alpha speakers
+  fields:
+    force:
+      name: Force
+      description: Force reload from server
+      default: false
+      selector:
+        boolean:
+
+test_connection:
+  name: Test connection
+  description: Test connection to Alpha speaker server
+  fields:
+    server_address:
+      name: Server address
+      description: Server address to test
+      required: false
+      example: "192.168.1.100:50051"
+      selector:
+        text:

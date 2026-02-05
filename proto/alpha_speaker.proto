@@ -1,0 +1,157 @@
+syntax = "proto3";
+
+package alpha_speaker;
+
+service AlphaSpeakerService {
+  // Регистрация Альфа колонки
+  rpc RegisterAlphaSpeaker (SpeakerRegistration) returns (RegistrationResponse);
+  
+  // Потоковая передача состояний устройств
+  rpc StreamDeviceStates (StateStreamRequest) returns (stream DeviceState);
+  
+  // Отправка текста для TTS (от колонки к HA) - НАПРАВЛЕНИЕ: Колонка → HA
+  rpc SendTextForSpeech (TTSRequest) returns (TTSResponse);
+  
+  // Получение TTS команд от HA - НАПРАВЛЕНИЕ: HA → Колонка
+  rpc StreamTTSCommands (StateStreamRequest) returns (stream SpeakTextRequest);
+  
+  // Отправка TTS ответа от колонки
+  rpc SendTTSResponse (SpeakTextResponse) returns (TTSResponse);
+  
+  // Отправка команды в HA через создание события
+  rpc SendAlphaCommand (AlphaCommand) returns (CommandResponse);
+  
+  // Проверка связи
+  rpc KeepAlive (PingRequest) returns (PingResponse);
+  
+  // Получение списка доступных устройств
+  rpc GetAvailableDevices (DeviceListRequest) returns (DeviceList);
+}
+
+// Регистрация Альфа колонки
+message SpeakerRegistration {
+  string speaker_id = 1;           // Уникальный ID колонки
+  string speaker_name = 2;         // "Альфа приватная умная колонка"
+  string speaker_type = 3;         // "alpha_private"
+  string firmware_version = 4;     // Версия прошивки колонки
+  repeated string capabilities = 5; // ["tts", "voice_control", "state_monitoring"]
+  map<string, string> settings = 6; // Дополнительные настройки колонки
+}
+
+message RegistrationResponse {
+  bool success = 1;
+  string message = 2;
+  string server_version = 3;
+  string session_id = 4;
+  map<string, string> server_settings = 5;
+}
+
+// Запрос состояний
+message StateStreamRequest {
+  string speaker_id = 1;
+  repeated string entity_filters = 2; // ["light.", "switch.", "sensor.", "climate."]
+  bool send_initial_state = 3;        // Отправить начальное состояние
+}
+
+message DeviceState {
+  string entity_id = 1;
+  string state = 2;
+  map<string, string> attributes = 3;
+  string friendly_name = 4;
+  string domain = 5;
+  int64 last_changed = 6;
+  int64 last_updated = 7;
+}
+
+// TTS запрос ОТ КОЛОНКИ к HA
+message TTSRequest {
+  string speaker_id = 1;
+  string text = 2;
+  string language = 3;               // "ru", "en", etc.
+  string voice = 4;                  // Голос для TTS
+  int32 volume = 5;                  // Громкость (0-100)
+  bool priority = 6;                 // Приоритетное воспроизведение
+}
+
+message TTSResponse {
+  bool success = 1;
+  string message_id = 2;
+  int64 timestamp = 3;
+}
+
+// TTS запрос ОТ HA к КОЛОНКЕ
+message SpeakTextRequest {
+  string speaker_id = 1;
+  string text = 2;
+  string language = 3;
+  string voice = 4;
+  int32 volume = 5;
+  bool priority = 6;
+  string message_id = 7;            // ID сообщения для отслеживания
+  int64 timestamp = 8;
+}
+
+// Ответ от колонки на TTS команду
+message SpeakTextResponse {
+  string speaker_id = 1;
+  bool success = 2;
+  string message = 3;
+  string message_id = 4;            // ID оригинального сообщения
+  int64 timestamp = 5;
+}
+
+// Команда от Альфа колонки
+message AlphaCommand {
+  string speaker_id = 1;
+  string command_type = 2;          // "turn_on", "turn_off", "toggle", "set_value"
+  string entity_id = 3;             // Целевое устройство
+  map<string, string> parameters = 4; // Параметры команды
+  string voice_command = 5;         // Оригинальная голосовая команда
+  int64 timestamp = 6;
+}
+
+message CommandResponse {
+  bool success = 1;
+  string event_id = 2;              // ID созданного события в HA
+  string result_state = 3;          // Результирующее состояние устройства
+  string message = 4;
+}
+
+// Список устройств
+message DeviceListRequest {
+  string speaker_id = 1;
+  repeated string domains = 2;      // Фильтр по доменам
+}
+
+message DeviceList {
+  repeated DeviceInfo devices = 1;
+  int32 total_count = 2;
+}
+
+message DeviceInfo {
+  string entity_id = 1;
+  string friendly_name = 2;
+  string domain = 3;
+  string current_state = 4;
+  repeated string supported_commands = 5;
+}
+
+// Ping/Pong
+message PingRequest {
+  string speaker_id = 1;
+}
+
+message PingResponse {
+  bool alive = 1;
+  int64 server_time = 2;
+  string status_message = 3;
+}
+
+// Типы событий для Альфа колонки
+enum AlphaEventType {
+  SPEAKER_CONNECTED = 0;
+  SPEAKER_DISCONNECTED = 1;
+  VOICE_COMMAND_RECEIVED = 2;
+  TTS_REQUESTED = 3;
+  DEVICE_STATE_CHANGED = 4;
+}

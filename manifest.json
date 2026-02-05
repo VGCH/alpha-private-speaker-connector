@@ -1,0 +1,27 @@
+{
+  "domain": "alpha_speaker",
+  "name": "Alpha Connector",
+  "codeowners": ["@VGCH"],
+  "version": "2.1.0",
+  "config_flow": true,
+  "documentation": "https://github.com/VGCH/alpha-private-speaker-connector",
+  "issue_tracker": "https://github.com/VGCH/alpha-private-speaker-connector/issues",
+  "requirements": [
+    "grpcio",
+    "grpcio-tools",
+    "aiohttp",
+    "protobuf"
+  ],
+  "dependencies": [],
+  "after_dependencies": [],
+  "iot_class": "local_push",
+  "loggers": ["alpha_speaker"],
+  "icon": "logo.png",
+  "logo": "logo.png",
+  "brand": {
+    "custom_components": "alpha_speaker",
+    "name": "Alpha Connector",
+    "integrations": ["alpha_speaker"]
+  },
+  "integration_type": "hub"
+}

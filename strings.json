@@ -1,0 +1,25 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Alpha Connector",
+        "description": "Configure Alpha Speaker Connector integration",
+        "data": {
+          "ha_token": "Home Assistant Token",
+          "ha_url": "Home Assistant URL",
+          "grpc_port": "gRPC Port",
+          "event_prefix": "Event Prefix",
+          "max_speakers": "Maximum Speakers"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Home Assistant",
+      "invalid_auth": "Invalid authentication token",
+      "unknown": "Unknown error occurred"
+    },
+    "abort": {
+      "already_configured": "Already configured"
+    }
+  }
+}
