@@ -26,7 +26,7 @@
 
 ### Способ 2: Ручная установка
 
-1. Скопируйте папку `alpha_speaker` в `custom_components/`
+1. Скопируйте папку `alpha-private-speaker-connector` в `custom_components/`
 2. Перезагрузите Home Assistant
 
 ## Настройка
