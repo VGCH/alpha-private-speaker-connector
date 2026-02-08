@@ -114,7 +114,7 @@ context:
 
 ## Поддержите проект финансово!
 
-<a href="https://dalink.to/cyberex_tech"><img width="300" src="https://github.com/VGCH/alpha-private-speaker-connector/blob/main/icons/donationalerts.png"/></a>
+<a href="https://dalink.to/cyberex_tech"><img width="200" src="https://github.com/VGCH/alpha-private-speaker-connector/blob/main/icons/donationalerts.png"/></a>
 
 
 
