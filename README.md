@@ -112,6 +112,9 @@ context:
   user_id: null
 ```
 
+## Поддержите проект финансово!
+
+<a href="https://dalink.to/cyberex_tech"><img width="300" src="https://github.com/VGCH/alpha-private-speaker-connector/blob/main/icons/donationalerts.png"/></a>
 
 
 
