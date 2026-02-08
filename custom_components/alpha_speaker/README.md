@@ -26,7 +26,7 @@
 
 ### Способ 2: Ручная установка
 
-1. Скопируйте папку `alpha-private-speaker-connector` в `custom_components/`
+1. Скопируйте папку `alpha_speaker` в `custom_components/`
 2. Перезагрузите Home Assistant
 
 ## Настройка
@@ -64,4 +64,57 @@ automation:
       - service: alpha_speaker.send_tts
         data:
           speaker_id: "{{ trigger.event.data.speaker_id }}"
-          text: "Получено сообщение: {{ trigger.event.data.text }}"```
+          text: "Получено сообщение: {{ trigger.event.data.text }}"
+```
+
+Пример получения и обработки команнд с Alpha колонок:
+
+```yaml
+automation:
+  - alias: "Alpha: Ответ на тестовое сообщение"
+    description: "Отвечает на команду 'Alpha is live!'"
+    trigger:
+      platform: event
+      event_type: alpha_speaker_command
+    condition:
+      condition: template
+      value_template: >
+        {{ 'alpha is live' in trigger.event.data.voice_command|lower }}
+    action:
+      - service: alpha_speaker.send_tts
+        data:
+          speaker_id: "{{ trigger.event.data.speaker_id }}"
+          text: "Я онлайн и готова к работе! Что вам нужно?"
+```
+
+## Отладка
+
+Для отладки событий необходимо перейти в панель разработчика вашего Home Assistant по адресу http://192.168.1.123:8123/developer-tools/event, **192.168.1.123** замените на ваш актуальный. В разделе **подписаться на событие** укажите alpha_speaker_command и нажмите **подписаться**.
+
+Пример поступающего события:
+
+```yaml
+event_type: alpha_speaker_command
+data:
+  speaker_id: alpha_smart_assistant_01
+  command_type: voice_action
+  entity_id: ""
+  parameters: {}
+  voice_command: Alpha is live!
+  timestamp: 1770525164
+  event_source: alpha_private_speaker
+  integration_event: true
+origin: LOCAL
+time_fired: "2026-02-08T04:32:43.981258+00:00"
+context:
+  id: 01KGXRC0EDTDMAM562JN2E84VZ
+  parent_id: null
+  user_id: null
+```
+
+
+
+
+
+
+
