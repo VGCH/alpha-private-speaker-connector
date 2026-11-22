@@ -1,6 +1,6 @@
 # Alpha Private Speaker Connector — Home Assistant
 
-Локальная интеграция Home Assistant для умных колонок Alpha / CYBEREX TECH. Связь между колонкой и Home Assistant выполняется по gRPC;
+Интеграция Home Assistant для умных колонок Alpha / CYBEREX TECH. Связь между колонкой и Home Assistant выполняется по gRPC;
 
 ## Возможности
 
@@ -14,9 +14,9 @@
 
 ## Установка
 
-### HACS
+### Marketplace (бывший HACS)
 
-1. Добавьте репозиторий `https://github.com/VGCH/alpha-private-speaker-connector` в HACS как пользовательский репозиторий типа **Integration**.
+1. Добавьте репозиторий `https://github.com/VGCH/alpha-private-speaker-connector` в Marketplace как пользовательский репозиторий типа **Integration**.
 2. Установите **Alpha Connector**.
 3. Перезапустите Home Assistant.
 4. Откройте **Настройки → Устройства и службы → Добавить интеграцию** и найдите **Alpha Connector**.
@@ -99,4 +99,4 @@ logger:
 
 ## Совместимость протокола
 
-В этой версии сохранены имена RPC, существующие поля protobuf и стандартные имена событий. Удаление сущности Home Assistant сейчас не передаётся отдельным сообщением: текущая схема `DeviceState` не содержит признака удаления. Для полноценной синхронизации удаления потребуется согласованное расширение protobuf и клиента колонки.
+В этой версии сохранены имена RPC, существующие поля protobuf и стандартные имена событий. 
