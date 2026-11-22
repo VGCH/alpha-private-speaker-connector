@@ -16,7 +16,8 @@ from .const import (
     DOMAIN,
     NAME,
     ICON_SPEAKER_MULTIPLE,
-    SENSOR_STATS
+    SENSOR_STATS,
+    INTEGRATION_VERSION,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -71,7 +72,7 @@ class AlphaSpeakerStatsSensor(SensorEntity):
             name=NAME,
             manufacturer="Alpha Speaker",
             model="Alpha Private Speaker",
-            sw_version="2.1.0",
+            sw_version=INTEGRATION_VERSION,
         )
         
         # Initial state

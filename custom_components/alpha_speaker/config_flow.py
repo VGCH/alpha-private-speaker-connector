@@ -1,113 +1,112 @@
-"""Config flow for Alpha Private Speaker."""
+"""Config flow для Alpha Connector."""
 from __future__ import annotations
 
-import voluptuous as vol
-from typing import Any
 import logging
+from typing import Any
+
+import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
 import homeassistant.helpers.config_validation as cv
+
+try:
+    # Актуальный API Home Assistant.
+    from homeassistant.config_entries import ConfigFlowResult
+except ImportError:  # Совместимость со старыми версиями HA.
+    from homeassistant.data_entry_flow import FlowResult as ConfigFlowResult
 
 from .const import (
     DOMAIN,
+    NAME,
     CONF_GRPC_PORT,
     CONF_EVENT_PREFIX,
     CONF_MAX_SPEAKERS,
-    CONF_HA_TOKEN,
-    CONF_HA_URL,
     DEFAULT_GRPC_PORT,
     DEFAULT_EVENT_PREFIX,
     DEFAULT_MAX_SPEAKERS,
-    DEFAULT_HA_URL
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for Alpha Private Speaker."""
-    
+    """Настройка единственного локального gRPC-коннектора."""
+
     VERSION = 1
-    
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle the initial step."""
-        errors = {}
-        
+    ) -> ConfigFlowResult:
+        """Показать и обработать форму первичной настройки."""
+        # Интеграция поднимает один локальный gRPC-сервер,
+        # поэтому второй config entry не допускается.
+        if self.hass.config_entries.async_entries(DOMAIN):
+            return self.async_abort(reason="already_configured")
+
         if user_input is not None:
-            # Для упрощения пропускаем проверку соединения на первом этапе
-            # Пользователь может настроить соединение позже
-            return self.async_create_entry(
-                title="Alpha Private Speaker Connector",
-                data=user_input
-            )
-        
-        # Показываем форму
-        data_schema = vol.Schema({
-            vol.Required(CONF_HA_TOKEN): str,
-            vol.Required(CONF_HA_URL, default=DEFAULT_HA_URL): str,
-            vol.Required(CONF_GRPC_PORT, default=DEFAULT_GRPC_PORT): cv.port,
-            vol.Optional(CONF_EVENT_PREFIX, default=DEFAULT_EVENT_PREFIX): str,
-            vol.Optional(CONF_MAX_SPEAKERS, default=DEFAULT_MAX_SPEAKERS): cv.positive_int,
-        })
-        
+            _LOGGER.debug("Получены настройки Alpha Connector")
+            return self.async_create_entry(title=NAME, data=user_input)
+
+        data_schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_GRPC_PORT,
+                    default=DEFAULT_GRPC_PORT,
+                ): cv.port,
+                vol.Optional(
+                    CONF_EVENT_PREFIX,
+                    default=DEFAULT_EVENT_PREFIX,
+                ): vol.All(cv.string, vol.Length(min=1, max=64)),
+                vol.Optional(
+                    CONF_MAX_SPEAKERS,
+                    default=DEFAULT_MAX_SPEAKERS,
+                ): vol.All(cv.positive_int, vol.Range(min=1, max=100)),
+            }
+        )
+
         return self.async_show_form(
             step_id="user",
             data_schema=data_schema,
-            errors=errors,
             description_placeholders={
                 "docs_url": "https://github.com/VGCH/alpha-private-speaker-connector"
-            }
+            },
         )
-    
+
     @staticmethod
     @callback
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
-        """Create the options flow."""
-        return OptionsFlowHandler(config_entry)
+        """Создать обработчик параметров интеграции."""
+        return OptionsFlowHandler()
 
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
-    """Handle options flow for Alpha Speaker."""
-    
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
-        self.config_entry = config_entry
-    
+    """Изменение параметров gRPC-сервера."""
+
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Manage the options."""
+    ) -> ConfigFlowResult:
+        """Показать и обработать форму параметров."""
         if user_input is not None:
-            # Update config entry
             return self.async_create_entry(title="", data=user_input)
-        
-        # Show current values
-        options_schema = vol.Schema({
-            vol.Required(
-                CONF_GRPC_PORT,
-                default=self.config_entry.options.get(CONF_GRPC_PORT, DEFAULT_GRPC_PORT)
-            ): cv.port,
-            vol.Optional(
-                CONF_EVENT_PREFIX,
-                default=self.config_entry.options.get(CONF_EVENT_PREFIX, DEFAULT_EVENT_PREFIX)
-            ): str,
-            vol.Optional(
-                CONF_MAX_SPEAKERS,
-                default=self.config_entry.options.get(CONF_MAX_SPEAKERS, DEFAULT_MAX_SPEAKERS)
-            ): cv.positive_int,
-            vol.Optional(
-                CONF_HA_URL,
-                default=self.config_entry.options.get(CONF_HA_URL, DEFAULT_HA_URL)
-            ): str,
-        })
-        
-        return self.async_show_form(
-            step_id="init",
-            data_schema=options_schema
+
+        current = {**self.config_entry.data, **self.config_entry.options}
+        data_schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_GRPC_PORT,
+                    default=current.get(CONF_GRPC_PORT, DEFAULT_GRPC_PORT),
+                ): cv.port,
+                vol.Optional(
+                    CONF_EVENT_PREFIX,
+                    default=current.get(CONF_EVENT_PREFIX, DEFAULT_EVENT_PREFIX),
+                ): vol.All(cv.string, vol.Length(min=1, max=64)),
+                vol.Optional(
+                    CONF_MAX_SPEAKERS,
+                    default=current.get(CONF_MAX_SPEAKERS, DEFAULT_MAX_SPEAKERS),
+                ): vol.All(cv.positive_int, vol.Range(min=1, max=100)),
+            }
         )
+        return self.async_show_form(step_id="init", data_schema=data_schema)

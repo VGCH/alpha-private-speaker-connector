@@ -1,338 +1,369 @@
-"""
-gRPC сервер для Альфы - версия для интеграции Home Assistant
-"""
+"""Асинхронный gRPC-сервер интеграции Alpha Speaker для Home Assistant."""
+from __future__ import annotations
+
 import asyncio
+import json
 import logging
-import uuid
 import time
-from typing import AsyncIterator, Dict, List, Optional, Any
+import uuid
+from typing import Any, AsyncIterator, Callable
+
 import grpc
 from grpc import aio
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.util import dt as dt_util
 
 from .proto import alpha_speaker_pb2 as pb
 from .proto import alpha_speaker_pb2_grpc as pb_grpc
 
 _LOGGER = logging.getLogger(__name__)
+SERVER_VERSION = "2.2.3"
+
+
+def serialize_attributes(attributes: dict[str, Any]) -> dict[str, str]:
+    """Преобразовать атрибуты HA в совместимый protobuf map<string, string>.
+
+    В protobuf-контракте attributes имеет тип map<string, string>, поэтому
+    числа, bool, списки и словари необходимо сериализовать в строки.
+    Строковые значения оставляем без JSON-кавычек для обратной совместимости.
+    """
+    result: dict[str, str] = {}
+    for key, value in attributes.items():
+        if isinstance(value, str):
+            result[str(key)] = value
+            continue
+        try:
+            result[str(key)] = json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        except (TypeError, ValueError):
+            result[str(key)] = str(value)
+    return result
+
+
+def _timestamp_ms(value: Any) -> int:
+    """Вернуть timestamp Home Assistant в миллисекундах Unix."""
+    try:
+        return int(dt_util.as_timestamp(value) * 1000)
+    except (TypeError, ValueError, OverflowError):
+        return int(time.time() * 1000)
 
 
 class AlphaSpeakerService(pb_grpc.AlphaSpeakerServiceServicer):
-    """Реализация gRPC сервиса для интеграции Home Assistant"""
-    
-    def __init__(self, hass: HomeAssistant, speaker_manager, event_prefix: str = "alpha_speaker_"):
+    """Реализация RPC API колонки Alpha."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        speaker_manager,
+        event_prefix: str = "alpha_speaker_",
+        max_speakers: int = 10,
+        grpc_port: int = 50051,
+    ) -> None:
         self.hass = hass
         self.speaker_manager = speaker_manager
         self.event_prefix = event_prefix
-        self.connected_speakers: Dict[str, Dict] = {}
-        self.active_state_streams: Dict[str, asyncio.Queue] = {}
-        self.active_tts_streams: Dict[str, asyncio.Queue] = {}
-        self.tts_responses: Dict[str, asyncio.Future] = {}
-        self.state_listeners: Dict[str, callable] = {}
+        self.max_speakers = max(1, int(max_speakers))
+        self.grpc_port = int(grpc_port)
+
+        self.connected_speakers: dict[str, dict[str, Any]] = {}
+        self.active_state_streams: dict[str, asyncio.Queue[pb.DeviceState]] = {}
+        self.active_tts_streams: dict[str, asyncio.Queue[pb.SpeakTextRequest]] = {}
+        self.tts_responses: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self.state_listeners: dict[str, Callable[[], None]] = {}
         self.running = True
-        
-    async def RegisterAlphaSpeaker(self, request: pb.SpeakerRegistration, context):
-        """Регистрация Альфы в интеграции"""
-        speaker_id = request.speaker_id
-        
-        # Получаем адрес клиента
-        peer_address = context.peer()
-        
-        # Регистрируем колонку в менеджере
+
+    async def _require_speaker(self, speaker_id: str, context) -> bool:
+        """Проверить, что колонка зарегистрирована в текущем серверном сеансе."""
+        if not speaker_id or speaker_id not in self.connected_speakers:
+            await context.abort(
+                grpc.StatusCode.UNAUTHENTICATED,
+                "Альфа не зарегистрирована. Сначала вызовите RegisterAlphaSpeaker.",
+            )
+            return False
+        return True
+
+    def _to_device_state(self, state) -> pb.DeviceState:
+        """Собрать protobuf DeviceState из объекта State Home Assistant."""
+        entity_id = state.entity_id
+        friendly_name = state.attributes.get("friendly_name") or entity_id
+        return pb.DeviceState(
+            entity_id=entity_id,
+            state=str(state.state),
+            attributes=serialize_attributes(dict(state.attributes)),
+            friendly_name=str(friendly_name),
+            domain=entity_id.partition(".")[0],
+            last_changed=_timestamp_ms(state.last_changed),
+            last_updated=_timestamp_ms(state.last_updated),
+        )
+
+    async def RegisterAlphaSpeaker(
+        self,
+        request: pb.SpeakerRegistration,
+        context,
+    ) -> pb.RegistrationResponse:
+        """Зарегистрировать колонку."""
+        speaker_id = request.speaker_id.strip()
+        if not speaker_id:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "speaker_id не должен быть пустым",
+            )
+
+        if (
+            speaker_id not in self.connected_speakers
+            and len(self.connected_speakers) >= self.max_speakers
+        ):
+            await context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                f"Достигнут лимит подключённых колонок: {self.max_speakers}",
+            )
+
+        peer_address = context.peer() or "unknown"
         session_id = await self.speaker_manager.register_speaker(
             speaker_id=speaker_id,
-            name=request.speaker_name,
-            speaker_type=request.speaker_type,
-            version=request.firmware_version,
+            name=request.speaker_name or f"Alpha {speaker_id}",
+            speaker_type=request.speaker_type or "alpha_private",
+            version=request.firmware_version or "unknown",
             capabilities=list(request.capabilities),
             address=peer_address,
-            settings=dict(request.settings)
+            settings=dict(request.settings),
         )
-        
-        speaker_info = {
-            'id': speaker_id,
-            'name': request.speaker_name,
-            'type': request.speaker_type,
-            'firmware': request.firmware_version,
-            'capabilities': list(request.capabilities),
-            'settings': dict(request.settings),
-            'session_id': session_id,
-            'address': peer_address,
-            'connected_at': time.time(),
-            'context': context,
-            'last_activity': time.time()
+
+        now = time.time()
+        self.connected_speakers[speaker_id] = {
+            "id": speaker_id,
+            "name": request.speaker_name or f"Alpha {speaker_id}",
+            "type": request.speaker_type or "alpha_private",
+            "firmware": request.firmware_version,
+            "capabilities": list(request.capabilities),
+            "settings": dict(request.settings),
+            "session_id": session_id,
+            "address": peer_address,
+            "connected_at": now,
+            "last_activity": now,
         }
-        
-        self.connected_speakers[speaker_id] = speaker_info
-        
-        _LOGGER.info(f"✅ Альфа зарегистрирована: {request.speaker_name} ({peer_address})")
-        
-        # Обновляем активность в менеджере
+
         await self.speaker_manager.update_speaker_activity(speaker_id)
-        
-        # Создаем событие подключения в HA через интеграцию
+
         self.hass.bus.async_fire(
             f"{self.event_prefix}connected",
             {
                 "speaker_id": speaker_id,
-                "speaker_name": request.speaker_name,
-                "speaker_type": request.speaker_type,
+                "speaker_name": request.speaker_name or f"Alpha {speaker_id}",
+                "speaker_type": request.speaker_type or "alpha_private",
                 "firmware_version": request.firmware_version,
                 "capabilities": list(request.capabilities),
                 "session_id": session_id,
                 "address": peer_address,
-                "timestamp": int(time.time() * 1000),
-                "integration_event": True
-            }
+                "timestamp": int(now * 1000),
+                "integration_event": True,
+            },
         )
-        
+
+        _LOGGER.info(
+            "Колонка зарегистрирована: %s (%s), адрес %s",
+            request.speaker_name or speaker_id,
+            speaker_id,
+            peer_address,
+        )
+
         return pb.RegistrationResponse(
             success=True,
-            message=f"Альфа '{request.speaker_name}' успешно зарегистрирована",
-            server_version="2.1.0",
+            message=f"Альфа '{request.speaker_name or speaker_id}' успешно зарегистрирована",
+            server_version=SERVER_VERSION,
             session_id=session_id,
             server_settings={
-                "grpc_port": "50051",
+                "grpc_port": str(self.grpc_port),
                 "event_prefix": self.event_prefix,
-                "integration_mode": "true"
-            }
+                "integration_mode": "true",
+                "max_speakers": str(self.max_speakers),
+            },
         )
-    
-    async def StreamDeviceStates(self, request: pb.StateStreamRequest, context) -> AsyncIterator[pb.DeviceState]:
-        """Потоковая передача состояний устройств через интеграцию"""
+
+    async def StreamDeviceStates(
+        self,
+        request: pb.StateStreamRequest,
+        context,
+    ) -> AsyncIterator[pb.DeviceState]:
+        """Передавать начальный снимок, затем изменения состояний HA.
+
+        Важно: подписчик устанавливается ДО чтения начального снимка. Изменения,
+        произошедшие во время передачи снимка, накапливаются в очереди и после
+        снимка отправляются клиенту. Это исключает окно потери событий.
+        """
         speaker_id = request.speaker_id
-        
-        if speaker_id not in self.connected_speakers:
-            context.abort(grpc.StatusCode.UNAUTHENTICATED, "Альфа не зарегистрирована")
-            return
-        
-        # Обновляем активность колонки
-        await self.speaker_manager.update_speaker_activity(speaker_id)
-        if speaker_id in self.connected_speakers:
-            self.connected_speakers[speaker_id]['last_activity'] = time.time()
-        
-        _LOGGER.info(f"▶ Начало потока состояний для Альфы {speaker_id}")
-        
-        # Создаем очередь для этого потока
-        queue = asyncio.Queue()
-        stream_id = f"states_{speaker_id}_{int(time.time())}"
+        await self._require_speaker(speaker_id, context)
+
+        filters = tuple(request.entity_filters)
+
+        def is_allowed(entity_id: str) -> bool:
+            return not filters or any(entity_id.startswith(prefix) for prefix in filters)
+
+        queue: asyncio.Queue[pb.DeviceState] = asyncio.Queue()
+        stream_id = f"states_{speaker_id}_{uuid.uuid4().hex}"
         self.active_state_streams[stream_id] = queue
-        
+
+        @callback
+        def handle_state_changed(event) -> None:
+            entity_id = event.data.get("entity_id")
+            if not entity_id or not is_allowed(entity_id):
+                return
+
+            # При удалении сущности new_state равен None. Текущий protobuf
+            # контракт не имеет флага удаления, поэтому такое событие пропускаем.
+            state = event.data.get("new_state")
+            if state is None:
+                _LOGGER.debug("Сущность удалена, событие пропущено: %s", entity_id)
+                return
+
+            try:
+                queue.put_nowait(self._to_device_state(state))
+            except Exception:
+                _LOGGER.exception(
+                    "Не удалось поставить обновление %s в очередь потока %s",
+                    entity_id,
+                    stream_id,
+                )
+
+        remove_listener = self.hass.bus.async_listen(
+            "state_changed",
+            handle_state_changed,
+        )
+        self.state_listeners[stream_id] = remove_listener
+
         try:
-            # Отправляем начальное состояние если запрошено
-            if request.send_initial_state:
-                # Используем встроенный метод Home Assistant
-                states = self.hass.states.async_all()
-                
-                for state in states:
-                    entity_id = state.entity_id
-                    
-                    # Применяем фильтры если указаны
-                    if request.entity_filters:
-                        if not any(entity_id.startswith(prefix) for prefix in request.entity_filters):
-                            continue
-                    
-                    friendly_name = state.attributes.get('friendly_name', entity_id)
-                    
-                    # Convert attributes to dict
-                    attrs = {}
-                    for key, value in state.attributes.items():
-                        if isinstance(value, (str, int, float, bool, list, dict)):
-                            attrs[key] = value
-                        else:
-                            attrs[key] = str(value)
-                    
-                    yield pb.DeviceState(
-                        entity_id=entity_id,
-                        state=state.state,
-                        attributes=attrs,
-                        friendly_name=friendly_name,
-                        domain=entity_id.split('.')[0],
-                        last_changed=int(time.time() * 1000),
-                        last_updated=int(time.time() * 1000)
-                    )
-            
-            # Подписываемся на изменения состояний через интеграцию
-            async def state_change_handler(event):
-                entity_id = event.data.get('entity_id')
-                
-                # Применяем фильтры если указаны
-                if request.entity_filters:
-                    if not any(entity_id.startswith(prefix) for prefix in request.entity_filters):
-                        return
-                
-                # Получаем состояние через интеграцию
-                state = self.hass.states.get(entity_id)
-                if state:
-                    friendly_name = state.attributes.get('friendly_name', entity_id)
-                    
-                    # Convert attributes to dict
-                    attrs = {}
-                    for key, value in state.attributes.items():
-                        if isinstance(value, (str, int, float, bool, list, dict)):
-                            attrs[key] = value
-                        else:
-                            attrs[key] = str(value)
-                    
-                    device_state = pb.DeviceState(
-                        entity_id=entity_id,
-                        state=state.state,
-                        attributes=attrs,
-                        friendly_name=friendly_name,
-                        domain=entity_id.split('.')[0],
-                        last_changed=int(time.time() * 1000),
-                        last_updated=int(time.time() * 1000)
-                    )
-                    
-                    # Отправляем в очередь для этого потока
-                    try:
-                        await queue.put(device_state)
-                    except Exception as e:
-                        _LOGGER.debug(f"Queue put error in state stream: {e}")
-            
-            # Подписываемся на события изменения состояний
-            remove_listener = self.hass.bus.async_listen(
-                "state_changed",
-                state_change_handler
+            await self.speaker_manager.update_speaker_activity(speaker_id)
+            self.connected_speakers[speaker_id]["last_activity"] = time.time()
+
+            _LOGGER.info(
+                "Запущен поток состояний: speaker=%s, filters=%s, initial=%s",
+                speaker_id,
+                list(filters),
+                request.send_initial_state,
             )
-            self.state_listeners[stream_id] = remove_listener
-            
-            # Отправка keep-alive и обновлений
-            last_keepalive = time.time()
-            
-            while not context.done() and self.running:
+
+            if request.send_initial_state:
+                states = self.hass.states.async_all()
+                sent_count = 0
+                for state in states:
+                    if not is_allowed(state.entity_id):
+                        continue
+                    yield self._to_device_state(state)
+                    sent_count += 1
+                _LOGGER.info(
+                    "Начальная синхронизация завершена: speaker=%s, отправлено=%d",
+                    speaker_id,
+                    sent_count,
+                )
+
+            last_activity_refresh = time.monotonic()
+            while (
+                self.running
+                and speaker_id in self.connected_speakers
+                and not context.done()
+            ):
                 try:
-                    # Проверяем очередь на наличие обновлений
-                    try:
-                        state_update = await asyncio.wait_for(queue.get(), timeout=0.5)
-                        yield state_update
-                        
-                        # Обновляем активность колонки при получении обновлений
-                        await self.speaker_manager.update_speaker_activity(speaker_id)
-                        if speaker_id in self.connected_speakers:
-                            self.connected_speakers[speaker_id]['last_activity'] = time.time()
-                        
-                    except asyncio.TimeoutError:
-                        pass
-                    
-                    # Отправляем keep-alive каждые 30 секунд
-                    current_time = time.time()
-                    if current_time - last_keepalive > 30:
-                        # Пустое сообщение для поддержания соединения
-                        yield pb.DeviceState()
-                        last_keepalive = current_time
-                        
-                        # Обновляем активность при отправке keep-alive
-                        await self.speaker_manager.update_speaker_activity(speaker_id)
-                        if speaker_id in self.connected_speakers:
-                            self.connected_speakers[speaker_id]['last_activity'] = current_time
-                        
-                except asyncio.CancelledError:
-                    _LOGGER.info(f"Поток состояний для {speaker_id} отменен")
-                    break
-                    
-        except Exception as e:
-            _LOGGER.error(f"❌ Ошибка в потоке состояний: {e}", exc_info=True)
+                    state_update = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield state_update
+                except asyncio.TimeoutError:
+                    # Обновляем last_seen, даже когда в доме нет изменений.
+                    pass
+
+                now_mono = time.monotonic()
+                if now_mono - last_activity_refresh >= 30:
+                    await self.speaker_manager.update_speaker_activity(speaker_id)
+                    speaker_info = self.connected_speakers.get(speaker_id)
+                    if speaker_info:
+                        speaker_info["last_activity"] = time.time()
+                    last_activity_refresh = now_mono
+
+        except asyncio.CancelledError:
+            _LOGGER.debug("Поток состояний отменён: %s", speaker_id)
+            raise
+        except Exception:
+            _LOGGER.exception("Ошибка потока состояний для %s", speaker_id)
+            raise
         finally:
-            # Очистка
-            if stream_id in self.active_state_streams:
-                del self.active_state_streams[stream_id]
-                _LOGGER.debug(f"Удален поток состояний: {stream_id}")
-            if stream_id in self.state_listeners:
-                remove_listener = self.state_listeners[stream_id]
-                remove_listener()
-                del self.state_listeners[stream_id]
-            
-            _LOGGER.info(f"⏹ Поток состояний для {speaker_id} завершен")
-    
-    async def StreamTTSCommands(self, request: pb.StateStreamRequest, context) -> AsyncIterator[pb.SpeakTextRequest]:
-        """Потоковая передача TTS команд для колонки (от HA к колонке)"""
+            remove = self.state_listeners.pop(stream_id, None)
+            if remove:
+                remove()
+            self.active_state_streams.pop(stream_id, None)
+            _LOGGER.info("Поток состояний остановлен: %s", speaker_id)
+
+    async def StreamTTSCommands(
+        self,
+        request: pb.StateStreamRequest,
+        context,
+    ) -> AsyncIterator[pb.SpeakTextRequest]:
+        """Держать отдельный поток команд TTS для каждой колонки."""
         speaker_id = request.speaker_id
-        
-        if speaker_id not in self.connected_speakers:
-            context.abort(grpc.StatusCode.UNAUTHENTICATED, "Альфа не зарегистрирована")
-            return
-        
-        _LOGGER.info(f"▶ Начало потока TTS команд для Альфы {speaker_id}")
-        
-        # Создаем очередь для TTS команд
-        queue = asyncio.Queue()
-        stream_id = f"tts_{speaker_id}_{int(time.time())}"
-        
-        # Сохраняем ссылку на очередь
+        await self._require_speaker(speaker_id, context)
+
+        queue: asyncio.Queue[pb.SpeakTextRequest] = asyncio.Queue(maxsize=100)
         self.active_tts_streams[speaker_id] = queue
-        _LOGGER.info(f"Создана очередь TTS для {speaker_id}. Всего активных TTS потоков: {len(self.active_tts_streams)}")
-        
+        _LOGGER.info("Запущен поток TTS-команд для %s", speaker_id)
+
         try:
-            # Проверяем, поддерживает ли колонка TTS
-            speaker_info = self.connected_speakers.get(speaker_id, {})
-            capabilities = speaker_info.get('capabilities', [])
-            
+            capabilities = self.connected_speakers[speaker_id].get("capabilities", [])
             if "tts" not in capabilities:
-                _LOGGER.warning(f"⚠ Колонка {speaker_id} не поддерживает TTS")
-            
-            # Основной цикл потока
-            last_keepalive = time.time()
-            
-            while not context.done() and self.running:
+                _LOGGER.warning("Колонка %s не объявила capability 'tts'", speaker_id)
+
+            last_activity_refresh = time.monotonic()
+            while (
+                self.running
+                and speaker_id in self.connected_speakers
+                and self.active_tts_streams.get(speaker_id) is queue
+                and not context.done()
+            ):
                 try:
-                    # Ожидаем TTS команду
-                    try:
-                        # Используем небольшой таймаут для проверки отмены
-                        tts_command = await asyncio.wait_for(queue.get(), timeout=1.0)
-                        
-                        if tts_command and tts_command.text:  # Не отправляем пустые команды
-                            _LOGGER.info(f"📢 Отправка TTS на колонку {speaker_id}: '{tts_command.text[:100]}...'")
-                            yield tts_command
-                            
-                            # Обновляем активность
-                            await self.speaker_manager.update_speaker_activity(speaker_id)
-                            if speaker_id in self.connected_speakers:
-                                self.connected_speakers[speaker_id]['last_activity'] = time.time()
-                            
-                    except asyncio.TimeoutError:
-                        # Проверяем, нужно ли отправить keep-alive
-                        current_time = time.time()
-                        if current_time - last_keepalive > 30:
-                            # Отправляем пустое сообщение keep-alive
-                            yield pb.SpeakTextRequest(
-                                speaker_id=speaker_id,
-                                text="",
-                                message_id=f"keepalive_{int(current_time)}",
-                                timestamp=int(current_time * 1000)
-                            )
-                            last_keepalive = current_time
-                            
-                except asyncio.CancelledError:
-                    _LOGGER.info(f"Поток TTS для {speaker_id} отменен")
-                    break
-                    
-        except Exception as e:
-            _LOGGER.error(f"❌ Ошибка в потоке TTS: {e}", exc_info=True)
+                    tts_command = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    if tts_command.text:
+                        _LOGGER.info(
+                            "Передача TTS-команды колонке %s: %s",
+                            speaker_id,
+                            tts_command.text[:100],
+                        )
+                        yield tts_command
+                except asyncio.TimeoutError:
+                    pass
+
+                now_mono = time.monotonic()
+                if now_mono - last_activity_refresh >= 30:
+                    await self.speaker_manager.update_speaker_activity(speaker_id)
+                    speaker_info = self.connected_speakers.get(speaker_id)
+                    if speaker_info:
+                        speaker_info["last_activity"] = time.time()
+                    last_activity_refresh = now_mono
+
+        except asyncio.CancelledError:
+            _LOGGER.debug("Поток TTS отменён: %s", speaker_id)
+            raise
+        except Exception:
+            _LOGGER.exception("Ошибка потока TTS для %s", speaker_id)
+            raise
         finally:
-            # Очистка - удаляем только если это та же очередь
-            if speaker_id in self.active_tts_streams and self.active_tts_streams[speaker_id] is queue:
-                del self.active_tts_streams[speaker_id]
-                _LOGGER.info(f"Удалена очередь TTS для {speaker_id}. Осталось активных TTS потоков: {len(self.active_tts_streams)}")
-            else:
-                _LOGGER.warning(f"Очередь TTS для {speaker_id} уже была удалена или заменена")
-            
-            _LOGGER.info(f"⏹ Поток TTS для {speaker_id} завершен")
-    
-    async def SendTTSResponse(self, request: pb.SpeakTextResponse, context):
-        """Обработка TTS ответа от колонки через интеграцию"""
+            if self.active_tts_streams.get(speaker_id) is queue:
+                self.active_tts_streams.pop(speaker_id, None)
+            _LOGGER.info("Поток TTS остановлен: %s", speaker_id)
+
+    async def SendTTSResponse(
+        self,
+        request: pb.SpeakTextResponse,
+        context,
+    ) -> pb.TTSResponse:
+        """Принять результат воспроизведения TTS от колонки."""
         speaker_id = request.speaker_id
         message_id = request.message_id
-        
-        _LOGGER.info(f"📢 TTS ответ от колонки {speaker_id}: success={request.success}")
-        
-        # Обновляем активность колонки
+
         if speaker_id in self.connected_speakers:
             await self.speaker_manager.update_speaker_activity(speaker_id)
-            self.connected_speakers[speaker_id]['last_activity'] = time.time()
-        
-        # Создаем событие ответа TTS в HA через интеграцию
+            self.connected_speakers[speaker_id]["last_activity"] = time.time()
+
         self.hass.bus.async_fire(
             f"{self.event_prefix}tts_response",
             {
@@ -342,426 +373,417 @@ class AlphaSpeakerService(pb_grpc.AlphaSpeakerServiceServicer):
                 "message": request.message,
                 "timestamp": request.timestamp,
                 "received_at": int(time.time() * 1000),
-                "integration_event": True
-            }
+                "integration_event": True,
+            },
         )
-        
-        # Если есть ожидающий Future для этого message_id, завершаем его
-        if message_id in self.tts_responses:
-            future = self.tts_responses[message_id]
-            if not future.done():
-                future.set_result({
+
+        future = self.tts_responses.pop(message_id, None)
+        if future and not future.done():
+            future.set_result(
+                {
                     "success": request.success,
                     "message": request.message,
-                    "speaker_id": speaker_id
-                })
-            del self.tts_responses[message_id]
-        
+                    "speaker_id": speaker_id,
+                }
+            )
+
         return pb.TTSResponse(
             success=True,
             message_id=message_id,
-            timestamp=int(time.time() * 1000)
+            timestamp=int(time.time() * 1000),
         )
-    
-    async def SendTextForSpeech(self, request: pb.TTSRequest, context):
-        """Отправка текста для озвучивания через интеграцию"""
+
+    async def SendTextForSpeech(
+        self,
+        request: pb.TTSRequest,
+        context,
+    ) -> pb.TTSResponse:
+        """Принять TTS-запрос от колонки и опубликовать событие HA."""
         speaker_id = request.speaker_id
-        _LOGGER.info(f"🎤 TTS запрос ОТ колонки {speaker_id}: '{request.text[:100]}...'")
-        
-        # Обновляем активность колонки
-        if speaker_id in self.connected_speakers:
-            await self.speaker_manager.update_speaker_activity(speaker_id)
-            self.connected_speakers[speaker_id]['last_activity'] = time.time()
-        
-        # Создаем событие TTS в HA через интеграцию
+        await self._require_speaker(speaker_id, context)
+        await self.speaker_manager.update_speaker_activity(speaker_id)
+        self.connected_speakers[speaker_id]["last_activity"] = time.time()
+
+        message_id = f"alpha_tts_{uuid.uuid4().hex}"
         event_data = {
             "speaker_id": speaker_id,
             "text": request.text,
-            "language": request.language,
-            "voice": request.voice if request.voice else "default",
+            "language": request.language or "ru",
+            "voice": request.voice or "default",
             "volume": request.volume,
             "priority": request.priority,
-            "message_id": f"alpha_tts_{int(time.time())}",
+            "message_id": message_id,
             "direction": "from_speaker",
             "timestamp": int(time.time() * 1000),
-            "integration_event": True
+            "integration_event": True,
         }
-        
-        self.hass.bus.async_fire(
-            f"{self.event_prefix}tts_request",
-            event_data
-        )
-        
+        self.hass.bus.async_fire(f"{self.event_prefix}tts_request", event_data)
+
         return pb.TTSResponse(
             success=True,
-            message_id=event_data["message_id"],
-            timestamp=int(time.time() * 1000)
+            message_id=message_id,
+            timestamp=event_data["timestamp"],
         )
-    
-    async def SendAlphaCommand(self, request: pb.AlphaCommand, context):
-        """Обработка команды от Альфы через интеграцию"""
+
+    async def SendAlphaCommand(
+        self,
+        request: pb.AlphaCommand,
+        context,
+    ) -> pb.CommandResponse:
+        """Принять голосовую команду и выполнить поддерживаемые сервисы HA."""
         speaker_id = request.speaker_id
-        _LOGGER.info(f"🎯 Команда от Альфы {speaker_id}: {request.command_type} -> {request.entity_id}")
-        
-        # Обновляем активность колонки
-        if speaker_id in self.connected_speakers:
-            await self.speaker_manager.update_speaker_activity(speaker_id)
-            self.connected_speakers[speaker_id]['last_activity'] = time.time()
-        
-        # Создаем событие команды в HA через интеграцию
+        await self._require_speaker(speaker_id, context)
+        await self.speaker_manager.update_speaker_activity(speaker_id)
+        self.connected_speakers[speaker_id]["last_activity"] = time.time()
+
+        parameters = dict(request.parameters)
         event_data = {
             "speaker_id": speaker_id,
             "command_type": request.command_type,
             "entity_id": request.entity_id,
-            "parameters": dict(request.parameters),
-            "voice_command": request.voice_command if request.voice_command else "",
-            "timestamp": request.timestamp if request.timestamp else int(time.time() * 1000),
+            "parameters": parameters,
+            "voice_command": request.voice_command or "",
+            "timestamp": request.timestamp or int(time.time() * 1000),
             "event_source": "alpha_private_speaker",
-            "integration_event": True
+            "integration_event": True,
         }
-        
-        self.hass.bus.async_fire(
-            f"{self.event_prefix}command",
-            event_data
-        )
-        
-        # Пытаемся выполнить команду напрямую через интеграцию
-        result_state = None
-        success = False
-        
-        if request.command_type in ["turn_on", "turn_off", "toggle"]:
-            domain = request.entity_id.split('.')[0]
-            try:
-                await self.hass.services.async_call(
-                    domain,
-                    request.command_type,
-                    {"entity_id": request.entity_id, **dict(request.parameters)},
-                    blocking=True
-                )
-                success = True
-                
-                # Получаем обновленное состояние через интеграцию
-                state = self.hass.states.get(request.entity_id)
-                if state:
-                    result_state = state.state
-            except Exception as e:
-                _LOGGER.error(f"Ошибка вызова сервиса: {e}")
+        self.hass.bus.async_fire(f"{self.event_prefix}command", event_data)
+
+        result_state = ""
+        success = True
+        message = f"Команда '{request.command_type}' принята"
+
+        if request.command_type in {"turn_on", "turn_off", "toggle"}:
+            entity_id = request.entity_id
+            if not entity_id or "." not in entity_id:
                 success = False
-        else:
-            # Для других команд считаем успешным просто создание события
-            success = True
-        
+                message = "Для команды управления необходимо указать корректный entity_id"
+            else:
+                domain = entity_id.partition(".")[0]
+                if not self.hass.services.has_service(domain, request.command_type):
+                    success = False
+                    message = f"Сервис {domain}.{request.command_type} не найден"
+                else:
+                    try:
+                        await self.hass.services.async_call(
+                            domain,
+                            request.command_type,
+                            {"entity_id": entity_id, **parameters},
+                            blocking=True,
+                        )
+                        state = self.hass.states.get(entity_id)
+                        if state:
+                            result_state = state.state
+                        message = f"Команда '{request.command_type}' выполнена"
+                    except Exception as err:  # HA service exceptions must become RPC results
+                        _LOGGER.exception("Ошибка выполнения %s для %s", request.command_type, entity_id)
+                        success = False
+                        message = str(err)
+
         return pb.CommandResponse(
             success=success,
-            event_id=f"cmd_{int(time.time())}",
-            result_state=result_state if result_state else "",
-            message=f"Команда '{request.command_type}' обработана"
+            event_id=f"cmd_{uuid.uuid4().hex}",
+            result_state=result_state,
+            message=message,
         )
-    
-    async def GetAvailableDevices(self, request: pb.DeviceListRequest, context):
-        """Получение списка доступных устройств через интеграцию"""
+
+    async def GetAvailableDevices(
+        self,
+        request: pb.DeviceListRequest,
+        context,
+    ) -> pb.DeviceList:
+        """Вернуть текущие сущности HA, при необходимости отфильтрованные по домену."""
         speaker_id = request.speaker_id
-        _LOGGER.info(f"📋 Запрос списка устройств от Альфы {speaker_id}")
-        
-        # Обновляем активность колонки
-        if speaker_id in self.connected_speakers:
-            await self.speaker_manager.update_speaker_activity(speaker_id)
-            self.connected_speakers[speaker_id]['last_activity'] = time.time()
-        
-        # Получаем все состояния через интеграцию
-        all_states = self.hass.states.async_all()
-        
+        await self._require_speaker(speaker_id, context)
+        await self.speaker_manager.update_speaker_activity(speaker_id)
+        self.connected_speakers[speaker_id]["last_activity"] = time.time()
+
+        domains = set(request.domains)
+        supported_by_domain = {
+            "light": ["turn_on", "turn_off", "toggle", "set_brightness"],
+            "switch": ["turn_on", "turn_off", "toggle"],
+            "climate": ["set_temperature", "set_mode"],
+            "media_player": ["play", "pause", "stop", "volume_set", "volume_up", "volume_down"],
+            "cover": ["open_cover", "close_cover", "stop_cover"],
+            "fan": ["turn_on", "turn_off", "set_speed"],
+            "scene": ["turn_on"],
+            "script": ["turn_on"],
+        }
+
         devices = []
-        for state in all_states:
+        for state in self.hass.states.async_all():
             entity_id = state.entity_id
-            domain = entity_id.split('.')[0]
-            
-            # Фильтруем по доменам если указаны
-            if request.domains and domain not in request.domains:
+            domain = entity_id.partition(".")[0]
+            if domains and domain not in domains:
                 continue
-            
-            # Определяем поддерживаемые команды на основе домена
-            supported_commands = []
-            if domain == "light":
-                supported_commands = ["turn_on", "turn_off", "toggle", "set_brightness"]
-            elif domain == "switch":
-                supported_commands = ["turn_on", "turn_off", "toggle"]
-            elif domain == "climate":
-                supported_commands = ["set_temperature", "set_mode"]
-            elif domain == "media_player":
-                supported_commands = ["play", "pause", "stop", "volume_set", "volume_up", "volume_down"]
-            elif domain == "cover":
-                supported_commands = ["open_cover", "close_cover", "stop_cover"]
-            elif domain == "fan":
-                supported_commands = ["turn_on", "turn_off", "set_speed"]
-            elif domain == "scene":
-                supported_commands = ["turn_on"]
-            elif domain == "script":
-                supported_commands = ["turn_on"]
-            
-            # Convert attributes to dict
-            attrs = {}
-            for key, value in state.attributes.items():
-                if isinstance(value, (str, int, float, bool, list, dict)):
-                    attrs[key] = value
-                else:
-                    attrs[key] = str(value)
-            
-            devices.append(pb.DeviceInfo(
-                entity_id=entity_id,
-                friendly_name=state.attributes.get('friendly_name', entity_id),
-                domain=domain,
-                current_state=state.state,
-                supported_commands=supported_commands
-            ))
-        
-        return pb.DeviceList(
-            devices=devices,
-            total_count=len(devices)
-        )
-    
-    async def KeepAlive(self, request: pb.PingRequest, context):
-        """Проверка связи с Альфой через интеграцию"""
-        speaker_id = request.speaker_id
-        is_alive = speaker_id in self.connected_speakers
-        
-        if is_alive:
-            # Обновляем активность колонки
-            await self.speaker_manager.update_speaker_activity(speaker_id)
-            self.connected_speakers[speaker_id]['last_activity'] = time.time()
-            
-            # Получаем информацию о колонке
-            speaker = await self.speaker_manager.get_speaker(speaker_id)
-            if speaker:
-                connected_time = int(time.time() - speaker.connected_at)
-                uptime_str = f"{connected_time // 3600}ч {(connected_time % 3600) // 60}м {connected_time % 60}с"
-                
-                # Проверяем активность
-                last_seen = self.connected_speakers[speaker_id]['last_activity']
-                current_time = time.time()
-                
-                if current_time - last_seen > 300:  # 5 минут
-                    status_msg = f"Колонка активна (uptime: {uptime_str}), но давно не проявляла активность"
-                else:
-                    status_msg = f"Колонка активна и работает нормально (uptime: {uptime_str})"
-            else:
-                status_msg = "Колонка активна"
-        else:
-            status_msg = "Колонка не зарегистрирована"
-        
-        return pb.PingResponse(
-            alive=is_alive,
-            server_time=int(time.time() * 1000),
-            status_message=status_msg
-        )
-    
-    async def send_tts_to_speaker(self, speaker_id: str, text: str, language: str = "ru", 
-                                 voice: str = "default", volume: int = 80, priority: bool = False) -> bool:
-        """Публичный метод для отправки TTS на колонку из HA через интеграцию"""
-        if speaker_id not in self.active_tts_streams:
-            _LOGGER.error(f"❌ Колонка {speaker_id} не подключена к потоку TTS. Активные потоки: {list(self.active_tts_streams.keys())}")
-            return False
-        
-        try:
-            message_id = f"tts_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-            
-            # Создаем TTS команду
-            tts_request = pb.SpeakTextRequest(
-                speaker_id=speaker_id,
-                text=text,
-                language=language,
-                voice=voice,
-                volume=volume,
-                priority=priority,
-                message_id=message_id,
-                timestamp=int(time.time() * 1000)
+            devices.append(
+                pb.DeviceInfo(
+                    entity_id=entity_id,
+                    friendly_name=str(state.attributes.get("friendly_name") or entity_id),
+                    domain=domain,
+                    current_state=str(state.state),
+                    supported_commands=supported_by_domain.get(domain, []),
+                )
             )
-            
-            # Создаем Future для ожидания ответа
-            future = asyncio.Future()
-            self.tts_responses[message_id] = future
-            
-            # Получаем очередь для этого динамика
-            queue = self.active_tts_streams.get(speaker_id)
-            if not queue:
-                _LOGGER.error(f"❌ Очередь для колонки {speaker_id} не найдена")
-                return False
-            
-            # Отправляем команду в очередь
-            _LOGGER.debug(f"Отправка TTS в очередь для колонки {speaker_id}")
+
+        return pb.DeviceList(devices=devices, total_count=len(devices))
+
+    async def KeepAlive(
+        self,
+        request: pb.PingRequest,
+        context,
+    ) -> pb.PingResponse:
+        """Обработать heartbeat от колонки."""
+        speaker_id = request.speaker_id
+        speaker_info = self.connected_speakers.get(speaker_id)
+        if not speaker_info:
+            return pb.PingResponse(
+                alive=False,
+                server_time=int(time.time() * 1000),
+                status_message="Колонка не зарегистрирована",
+            )
+
+        await self.speaker_manager.update_speaker_activity(speaker_id)
+        speaker_info["last_activity"] = time.time()
+        speaker = await self.speaker_manager.get_speaker(speaker_id)
+        uptime = max(0, int(time.time() - speaker.connected_at)) if speaker else 0
+        status = (
+            f"Колонка активна и работает нормально (uptime: "
+            f"{uptime // 3600}ч {(uptime % 3600) // 60}м {uptime % 60}с)"
+        )
+        return pb.PingResponse(
+            alive=True,
+            server_time=int(time.time() * 1000),
+            status_message=status,
+        )
+
+    async def send_tts_to_speaker(
+        self,
+        speaker_id: str,
+        text: str,
+        language: str = "ru",
+        voice: str = "default",
+        volume: int = 80,
+        priority: bool = False,
+    ) -> bool:
+        """Отправить TTS колонке и дождаться её ответа."""
+        queue = self.active_tts_streams.get(speaker_id)
+        if not queue or speaker_id not in self.connected_speakers:
+            _LOGGER.warning(
+                "Нет активного TTS-потока для %s. Активные потоки: %s",
+                speaker_id,
+                list(self.active_tts_streams),
+            )
+            return False
+
+        message_id = f"tts_{uuid.uuid4().hex}"
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self.tts_responses[message_id] = future
+
+        request = pb.SpeakTextRequest(
+            speaker_id=speaker_id,
+            text=text,
+            language=language,
+            voice=voice,
+            volume=max(0, min(100, int(volume))),
+            priority=priority,
+            message_id=message_id,
+            timestamp=int(time.time() * 1000),
+        )
+
+        try:
             try:
-                await queue.put(tts_request)
-            except Exception as e:
-                _LOGGER.error(f"❌ Ошибка при отправке в очередь для колонки {speaker_id}: {e}")
-                # Удаляем запись, так как очередь может быть закрыта
-                if speaker_id in self.active_tts_streams and self.active_tts_streams[speaker_id] is queue:
-                    del self.active_tts_streams[speaker_id]
-                # Удаляем future из ожидающих
-                if message_id in self.tts_responses:
-                    del self.tts_responses[message_id]
+                queue.put_nowait(request)
+            except asyncio.QueueFull:
+                _LOGGER.warning("Очередь TTS переполнена для %s", speaker_id)
                 return False
-            
-            # Создаем событие в HA об отправке TTS через интеграцию
+
             self.hass.bus.async_fire(
                 f"{self.event_prefix}tts_command_sent",
                 {
                     "speaker_id": speaker_id,
                     "text": text,
                     "language": language,
-                    "volume": volume,
+                    "volume": request.volume,
                     "message_id": message_id,
-                    "timestamp": tts_request.timestamp,
-                    "integration_event": True
-                }
+                    "timestamp": request.timestamp,
+                    "integration_event": True,
+                },
             )
-            
-            _LOGGER.info(f"✅ TTS команда отправлена колонке {speaker_id}: '{text[:50]}...'")
-            
-            # Ждем ответа (таймаут 30 секунд)
+
             try:
                 response = await asyncio.wait_for(future, timeout=30.0)
-                success = response.get('success', False)
-                if success:
-                    _LOGGER.info(f"✅ TTS выполнен колонкой {speaker_id}: успешно")
-                    return True
-                else:
-                    _LOGGER.warning(f"⚠ Колонка {speaker_id} сообщила об ошибке выполнения TTS: {response.get('message', 'No message')}")
-                    return False
+                return bool(response.get("success"))
             except asyncio.TimeoutError:
-                _LOGGER.warning(f"⚠ Таймаут ожидания TTS ответа от колонки {speaker_id}")
-                if message_id in self.tts_responses:
-                    del self.tts_responses[message_id]
+                _LOGGER.warning("Истёк таймаут ожидания TTS-ответа от %s", speaker_id)
                 return False
-                
-        except Exception as e:
-            _LOGGER.error(f"❌ Ошибка отправки TTS на колонку {speaker_id}: {e}", exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("Ошибка отправки TTS на %s", speaker_id)
             return False
-    
-    async def _cleanup_inactive_speakers(self):
-        """Очистка неактивных колонок через интеграцию"""
+        finally:
+            self.tts_responses.pop(message_id, None)
+
+    async def _cleanup_inactive_speakers(self) -> None:
+        """Удалять колонки, которые не проявляли активность более часа."""
         while self.running:
             try:
-                await asyncio.sleep(60)  # Проверяем каждую минуту
-                
-                current_time = time.time()
-                to_remove = []
-                
-                for speaker_id, speaker_info in self.connected_speakers.items():
-                    # Удаляем колонки неактивные более 1 часа
-                    if current_time - speaker_info['last_activity'] > 3600:
-                        to_remove.append(speaker_id)
-                        
-                        # Закрываем активные потоки
-                        if speaker_id in self.active_tts_streams:
-                            del self.active_tts_streams[speaker_id]
-                        
-                        # Отправляем событие отключения через интеграцию
-                        self.hass.bus.async_fire(
-                            f"{self.event_prefix}disconnected",
-                            {
-                                "speaker_id": speaker_id,
-                                "speaker_name": speaker_info['name'],
-                                "reason": "inactivity_timeout",
-                                "timestamp": int(current_time * 1000),
-                                "integration_event": True
-                            }
-                        )
-                
-                for speaker_id in to_remove:
-                    if speaker_id in self.connected_speakers:
-                        del self.connected_speakers[speaker_id]
-                        _LOGGER.info(f"🗑️ Удалена неактивная колонка: {speaker_id}")
-                        
-            except Exception as e:
-                _LOGGER.error(f"❌ Ошибка в cleanup task: {e}")
+                await asyncio.sleep(60)
+                now = time.time()
+                inactive_ids = [
+                    speaker_id
+                    for speaker_id, info in self.connected_speakers.items()
+                    if now - info.get("last_activity", 0) > 3600
+                ]
+
+                for speaker_id in inactive_ids:
+                    info = self.connected_speakers.pop(speaker_id, None)
+                    if not info:
+                        continue
+                    self.active_tts_streams.pop(speaker_id, None)
+                    await self.speaker_manager.remove_speaker(speaker_id)
+                    self.hass.bus.async_fire(
+                        f"{self.event_prefix}disconnected",
+                        {
+                            "speaker_id": speaker_id,
+                            "speaker_name": info.get("name", speaker_id),
+                            "reason": "inactivity_timeout",
+                            "timestamp": int(now * 1000),
+                            "integration_event": True,
+                        },
+                    )
+                    _LOGGER.info("Удалена неактивная колонка: %s", speaker_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception("Ошибка фоновой очистки колонок")
                 await asyncio.sleep(10)
-    
-    async def stop(self):
-        """Остановка сервиса."""
+
+    async def stop(self) -> None:
+        """Остановить обработчики сервиса."""
         self.running = False
-        _LOGGER.info("Остановка AlphaSpeakerService...")
+        for future in self.tts_responses.values():
+            if not future.done():
+                future.set_result({"success": False, "message": "Сервер остановлен"})
+        self.tts_responses.clear()
+        _LOGGER.info("AlphaSpeakerService остановлен")
 
 
 class AlphaSpeakerServer:
-    """Управление gRPC сервером для интеграции Home Assistant"""
-    
-    def __init__(self, hass: HomeAssistant, port: int, event_prefix: str = "alpha_speaker_", 
-                 max_speakers: int = 10, speaker_manager=None):
+    """Жизненный цикл gRPC-сервера интеграции."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        port: int,
+        event_prefix: str = "alpha_speaker_",
+        max_speakers: int = 10,
+        speaker_manager=None,
+    ) -> None:
         self.hass = hass
-        self.port = port
+        self.port = int(port)
         self.event_prefix = event_prefix
         self.max_speakers = max_speakers
-        
         self.speaker_manager = speaker_manager
-        self.server = None
-        self.cleanup_task = None
-        self.servicer = None
-    
-    async def start(self):
-        """Запуск gRPC сервера для интеграции"""
-        if not self.speaker_manager:
-            from .speaker_manager import SpeakerManager
-            # Используем временное хранилище
-            self.speaker_manager = SpeakerManager(self.hass, "temp", None)
-        
-        self.server = aio.server(
+        self.server: aio.Server | None = None
+        self.cleanup_task: asyncio.Task | None = None
+        self.servicer: AlphaSpeakerService | None = None
+        self.bound_port: int | None = None
+
+    async def start(self) -> bool:
+        """Создать и запустить gRPC-сервер."""
+        if self.server is not None:
+            return True
+        if self.speaker_manager is None:
+            raise RuntimeError("speaker_manager должен быть передан при запуске сервера")
+
+        server = aio.server(
             options=[
-                ('grpc.max_receive_message_length', 50 * 1024 * 1024),
-                ('grpc.max_send_message_length', 50 * 1024 * 1024),
-                ('grpc.keepalive_time_ms', 10000),
-                ('grpc.keepalive_timeout_ms', 5000),
-                ('grpc.http2.max_ping_strikes', 0),
+                ("grpc.max_receive_message_length", 50 * 1024 * 1024),
+                ("grpc.max_send_message_length", 50 * 1024 * 1024),
+                ("grpc.keepalive_time_ms", 30000),
+                ("grpc.keepalive_timeout_ms", 10000),
+                ("grpc.http2.max_ping_strikes", 0),
             ],
-            maximum_concurrent_rpcs=100
+            maximum_concurrent_rpcs=100,
         )
-        
-        self.servicer = AlphaSpeakerService(self.hass, self.speaker_manager, self.event_prefix)
-        pb_grpc.add_AlphaSpeakerServiceServicer_to_server(self.servicer, self.server)
-        
-        self.server.add_insecure_port(f'[::]:{self.port}')
-        await self.server.start()
-        
-        # Запускаем задачу очистки неактивных колонок
-        self.cleanup_task = asyncio.create_task(self.servicer._cleanup_inactive_speakers())
-        
-        _LOGGER.info(f"✅ Сервер Альфы запущен (интеграция)")
-        _LOGGER.info(f"📍 Порт: {self.port}")
-        _LOGGER.info(f"📍 Префикс событий: {self.event_prefix}")
-        _LOGGER.info(f"📍 HA Integration: готов к работе")
-        
+        servicer = AlphaSpeakerService(
+            self.hass,
+            self.speaker_manager,
+            self.event_prefix,
+            self.max_speakers,
+            self.port,
+        )
+        pb_grpc.add_AlphaSpeakerServiceServicer_to_server(servicer, server)
+
+        bound_port = server.add_insecure_port(f"[::]:{self.port}")
+        if bound_port == 0:
+            await server.stop(grace=0)
+            raise RuntimeError(f"Не удалось открыть gRPC-порт {self.port}")
+
+        try:
+            await server.start()
+        except Exception:
+            await server.stop(grace=0)
+            raise
+
+        self.server = server
+        self.servicer = servicer
+        self.bound_port = bound_port
+        self.cleanup_task = asyncio.create_task(
+            servicer._cleanup_inactive_speakers(),
+            name="alpha_speaker_cleanup",
+        )
+
+        _LOGGER.info(
+            "Alpha Speaker gRPC-сервер запущен на порту %s (лимит колонок: %s)",
+            bound_port,
+            self.max_speakers,
+        )
         return True
-    
-    async def stop(self):
-        """Остановка сервера для интеграции"""
-        _LOGGER.info("🛑 Остановка Alpha Speaker Server (интеграция)...")
-        
+
+    async def stop(self) -> None:
+        """Остановить фоновые задачи и gRPC-сервер."""
+        _LOGGER.info("Остановка Alpha Speaker gRPC-сервера")
+
+        if self.servicer:
+            await self.servicer.stop()
+
         if self.cleanup_task:
             self.cleanup_task.cancel()
             try:
                 await self.cleanup_task
             except asyncio.CancelledError:
                 pass
-        
-        if self.servicer:
-            await self.servicer.stop()
-        
+            self.cleanup_task = None
+
         if self.server:
             await self.server.stop(grace=5)
-        
-        _LOGGER.info("✅ Alpha Speaker Server остановлен")
-    
-    async def send_tts_to_speaker(self, speaker_id: str, text: str, language: str = "ru", 
-                                 voice: str = "default", volume: int = 80, priority: bool = False) -> bool:
-        """Публичный метод для отправки TTS на колонку"""
+            self.server = None
+
+        self.servicer = None
+        self.bound_port = None
+        _LOGGER.info("Alpha Speaker gRPC-сервер остановлен")
+
+    async def send_tts_to_speaker(
+        self,
+        speaker_id: str,
+        text: str,
+        language: str = "ru",
+        voice: str = "default",
+        volume: int = 80,
+        priority: bool = False,
+    ) -> bool:
+        """Публичный метод отправки TTS для сервисов HA."""
         if not self.servicer:
-            _LOGGER.error("Сервис не инициализирован")
+            _LOGGER.error("Нельзя отправить TTS: gRPC-сервер не запущен")
             return False
-        
         return await self.servicer.send_tts_to_speaker(
             speaker_id=speaker_id,
             text=text,
             language=language,
             voice=voice,
             volume=volume,
-            priority=priority
+            priority=priority,
         )

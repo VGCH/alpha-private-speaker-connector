@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.device_tracker import SourceType
@@ -12,6 +13,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity import DeviceInfo
 
 from .const import DOMAIN
+from .network import speaker_configuration_url
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,10 +68,11 @@ class AlphaSpeakerDeviceTracker(ScannerEntity):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, f"speaker_{speaker_id_clean}")},
             name=speaker_name,
-            manufacturer=speaker.manufacturer or "Alpha Speaker",
+            manufacturer="CYBEREX TECH",
             model=speaker.speaker_type or "Alpha Private Speaker",
-            sw_version=speaker.version or "2.1.0",
+            sw_version=speaker.version or "2.2.3",
             via_device=(DOMAIN, entry.entry_id),
+            configuration_url=speaker_configuration_url(speaker.address),
         )
         
         # Initial state
@@ -78,10 +81,9 @@ class AlphaSpeakerDeviceTracker(ScannerEntity):
         self._attr_ip_address = speaker.address if hasattr(speaker, 'address') else "unknown"
     
     @property
-    def mac_address(self) -> str:
-        """Return the mac address of the device."""
-        # Use speaker ID as MAC address
-        return self.speaker_id_clean
+    def mac_address(self) -> str | None:
+        """MAC-адрес не предоставляется протоколом Alpha."""
+        return None
     
     async def async_update(self) -> None:
         """Update device tracker state."""
@@ -97,7 +99,7 @@ class AlphaSpeakerDeviceTracker(ScannerEntity):
                 return
             
             # Update connection state based on last activity
-            current_time = datetime.now().timestamp()
+            current_time = time.time()
             is_connected = (current_time - speaker.last_seen) < 300  # 5 minutes
             
             self._attr_is_connected = is_connected

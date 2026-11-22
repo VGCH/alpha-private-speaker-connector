@@ -1,120 +1,106 @@
-# Alpha Private Speaker Connector - Home Assistant Integration
+# Alpha Private Speaker Connector — Home Assistant
 
-![Logo](https://github.com/VGCH/alpha-private-speaker-connector/blob/main/icons/dark_logo.png)
-
-Коннектор для локальных умных колонок Alpha от CYBEREX TECH для Home Assistant с полной приватностью.
+Локальная интеграция Home Assistant для умных колонок Alpha / CYBEREX TECH. Связь между колонкой и Home Assistant выполняется по gRPC; отдельный внешний HTTP API или long-lived access token не требуется.
 
 ## Возможности
 
-✅ **Голосовое управление** умным домом  
-✅ **Локальный TTS** (озвучивание текста)  
-✅ **Мониторинг состояний** устройств в реальном времени  
-✅ **Двусторонняя связь** через gRPC  
-✅ **Полная приватность** - все данные передаются локально  
-✅ **Поддержка подключения группы** колонок  
+- регистрация нескольких колонок Alpha;
+- потоковая отправка начальных состояний Home Assistant и последующих изменений;
+- приём голосовых команд и публикация событий Home Assistant;
+- двусторонний TTS: запросы от колонки в HA и отправка текста из HA на колонку;
+- список доступных сущностей с фильтрацией по доменам;
+- контроль активности колонок и статистические сущности;
+- локальная передача данных без стороннего облака.
 
 ## Установка
 
-### Способ 1: Через HACS (рекомендуется)
+### HACS
 
-1. Установите [HACS](https://hacs.xyz/) если еще не установлен
-2. В HACS перейдите в "Интеграции"
-3. Нажмите три точки → "Пользовательские репозитории"
-4. Добавьте `https://github.com/VGCH/alpha-private-speaker-connector`
-5. Найдите "Alpha Connector" и установите
-6. Перезагрузите Home Assistant
+1. Добавьте репозиторий `https://github.com/VGCH/alpha-private-speaker-connector` в HACS как пользовательский репозиторий типа **Integration**.
+2. Установите **Alpha Connector**.
+3. Перезапустите Home Assistant.
+4. Откройте **Настройки → Устройства и службы → Добавить интеграцию** и найдите **Alpha Connector**.
 
-### Способ 2: Ручная установка
+### Вручную
 
-1. Скопируйте папку `alpha_speaker` в `custom_components/`
-2. Перезагрузите Home Assistant
+Скопируйте каталог `custom_components/alpha_speaker` в `config/custom_components/alpha_speaker`, затем перезапустите Home Assistant.
 
 ## Настройка
 
-1. Перейдите в Настройки → Интеграции → Добавить
-2. Найдите "Alpha Connector"
-3. Заполните конфигурацию:
-   - **Токен Home Assistant** (обязательно)
-   - **URL Home Assistant** (по умолчанию: http://localhost:8123)
-   - **gRPC порт** (по умолчанию: 50051)
-   - **Префикс событий** (по умолчанию: alpha_speaker_)
-   - **Максимум колонок** (по умолчанию: 10)
+- **gRPC port** — порт сервера, по умолчанию `50051`.
+- **Event prefix** — префикс событий, по умолчанию `alpha_speaker_`.
+- **Maximum speakers** — максимальное количество одновременно зарегистрированных колонок, по умолчанию `10`.
 
-## Использование
+Интеграция использует внутренний API Home Assistant, поэтому поля URL и токена HA не нужны. Старые записи конфигурации с этими полями поддерживаются: лишние значения игнорируются.
 
-### Сервисы
+После установки убедитесь, что порт TCP `50051` (или заданный вами порт) доступен колонке в локальной сети. Сервер слушает все сетевые интерфейсы. Текущий gRPC endpoint использует незашифрованное локальное соединение; не публикуйте этот порт напрямую в Интернет.
 
-Доступные сервисы в Developer Tools → Services:
+## Поток состояний
 
-1. **alpha_speaker.send_tts** - отправка текста на колонку
-2. **alpha_speaker.reload_speakers** - перезагрузка списка колонок
-3. **alpha_speaker.test_connection** - проверка соединения
+Клиент колонки должен вызвать `StreamDeviceStates` один раз с `send_initial_state=true`. Сервер сначала устанавливает подписку на `state_changed`, затем отправляет снимок текущих сущностей, после чего передаёт изменения через тот же поток. Повторный вызов для получения начальных состояний не требуется.
 
-### Автоматизации
+Например, фильтры:
 
-Пример автоматизации для озвучивания уведомлений:
-
-```yaml
-automation:
-  - alias: "TTS Notification"
-    trigger:
-      platform: event
-      event_type: alpha_speaker_tts_request
-    action:
-      - service: alpha_speaker.send_tts
-        data:
-          speaker_id: "{{ trigger.event.data.speaker_id }}"
-          text: "Получено сообщение: {{ trigger.event.data.text }}"
+```python
+filters = ["light.", "switch.", "sensor.meteostantsiia", "button."]
 ```
 
-Пример получения и обработки команнд с Alpha колонок:
+означают все сущности доменов `light`, `switch`, `button`, а также сущности, идентификаторы которых начинаются с `sensor.meteostantsiia`.
+
+Атрибуты Home Assistant передаются как строки, поскольку поле `DeviceState.attributes` в protobuf объявлено как `map<string, string>`. Строковые значения остаются строками; остальные значения сериализуются в JSON-строки.
+
+## Сервисы
+
+- `alpha_speaker.send_tts` — отправить текст на колонку. Требуются `speaker_id` и `text`; доступны `language`, `voice`, `volume` (0–100) и `priority`.
+- `alpha_speaker.reload_speakers` — опубликовать событие `alpha_speaker_reload_request`, чтобы клиентская часть могла повторно объявить регистрацию.
+- `alpha_speaker.test_connection` — опубликовать событие `alpha_speaker_test_response` с состоянием локального gRPC-сервера.
+
+## События
+
+При стандартном префиксе интеграция публикует:
+
+- `alpha_speaker_connected`
+- `alpha_speaker_disconnected`
+- `alpha_speaker_command`
+- `alpha_speaker_tts_request`
+- `alpha_speaker_tts_response`
+- `alpha_speaker_tts_command_sent`
+- `alpha_speaker_connector_started`
+- `alpha_speaker_connector_stopped`
+
+Пример автоматизации ответа на голосовую команду:
 
 ```yaml
-automation:
-  - alias: "Alpha: Ответ на тестовое сообщение"
-    description: "Отвечает на команду 'Alpha is live!'"
-    trigger:
-      platform: event
-      event_type: alpha_speaker_command
-    condition:
-      condition: template
-      value_template: >
-        {{ 'alpha is live' in trigger.event.data.voice_command|lower }}
-    action:
-      - service: alpha_speaker.send_tts
-        data:
-          speaker_id: "{{ trigger.event.data.speaker_id }}"
-          text: "Я онлайн и готова к работе! Что вам нужно?"
+alias: "Alpha — ответ на голосовую команду"
+triggers:
+  - trigger: event
+    event_type: alpha_speaker_command
+conditions:
+  - condition: template
+    value_template: "{{ 'alpha is live' in trigger.event.data.voice_command | lower }}"
+actions:
+  - action: alpha_speaker.send_tts
+    data:
+      speaker_id: "{{ trigger.event.data.speaker_id }}"
+      text: "Я онлайн и готова к работе! Что вам нужно?"
 ```
 
 ## Отладка
 
-Для отладки событий необходимо перейти в панель разработчика вашего Home Assistant по адресу http://192.168.1.123:8123/developer-tools/event, **192.168.1.123** замените на ваш актуальный. В разделе **подписаться на событие** укажите alpha_speaker_command и нажмите **подписаться**.
-
-Пример поступающего события:
+Для диагностики включите debug-логирование:
 
 ```yaml
-event_type: alpha_speaker_command
-data:
-  speaker_id: alpha_smart_assistant_01
-  command_type: voice_action
-  entity_id: ""
-  parameters: {}
-  voice_command: Alpha is live!
-  timestamp: 1770525164
-  event_source: alpha_private_speaker
-  integration_event: true
-origin: LOCAL
-time_fired: "2026-02-08T04:32:43.981258+00:00"
-context:
-  id: 01KGXRC0EDTDMAM562JN2E84VZ
-  parent_id: null
-  user_id: null
+logger:
+  logs:
+    custom_components.alpha_speaker: debug
 ```
 
+Проверьте журнал Home Assistant на записи `Начальная синхронизация завершена` и `Поток состояний остановлен`. Если начальный снимок содержит сущности, но они не появляются на колонке, проверьте обработчик `DeviceState` в клиентской части и корректное декодирование атрибутов JSON-строк.
 
+## Совместимость протокола
 
+В этой версии сохранены имена RPC, существующие поля protobuf и стандартные имена событий. Удаление сущности Home Assistant сейчас не передаётся отдельным сообщением: текущая схема `DeviceState` не содержит признака удаления. Для полноценной синхронизации удаления потребуется согласованное расширение protobuf и клиента колонки.
 
+## Веб-панель колонки
 
-
-
+В карточке устройства колонки в Home Assistant отображается ссылка на локальную веб-панель `http://<IP-колонки>:8000`. IP извлекается из адреса удалённого gRPC-подключения (`context.peer()`); для IPv4 и IPv6 используется корректный формат URL. Ссылка обновляется при повторной регистрации колонки с нового адреса.

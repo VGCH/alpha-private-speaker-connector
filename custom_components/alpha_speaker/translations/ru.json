@@ -2,42 +2,38 @@
   "config": {
     "step": {
       "user": {
-        "title": "Настройка Alpha Connector",
-        "description": "Настройки интеграции Alpha Connector",
+        "title": "Alpha Connector",
+        "description": "Настройка локального gRPC-сервера для колонок Alpha",
         "data": {
-          "ha_token": "Токен Home Assistant",
-          "ha_url": "URL Home Assistant",
-          "grpc_port": "gRPC порт",
+          "grpc_port": "gRPC-порт",
           "event_prefix": "Префикс событий",
           "max_speakers": "Максимальное количество колонок"
         }
       }
     },
-    "error": {
-      "cannot_connect": "Не удалось подключиться к Home Assistant",
-      "invalid_auth": "Неверный токен аутентификации",
-      "unknown": "Неизвестная ошибка"
-    },
     "abort": {
-      "already_configured": "Уже настроено"
+      "already_configured": "Интеграция уже настроена"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Параметры Alpha Connector",
+        "data": {
+          "grpc_port": "gRPC-порт",
+          "event_prefix": "Префикс событий",
+          "max_speakers": "Максимальное количество колонок"
+        }
+      }
     }
   },
   "entity": {
     "binary_sensor": {
-      "connector": {
-        "name": "Коннектор"
-      },
-      "speaker": {
-        "name": "Колонка"
-      },
-      "statistics": {
-        "name": "Статистика"
-      }
+      "connector": { "name": "Коннектор" },
+      "speaker": { "name": "Колонка" }
     },
     "sensor": {
-      "statistics": {
-        "name": "Статистика"
-      }
+      "statistics": { "name": "Статистика" }
     }
   }
 }
