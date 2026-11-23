@@ -1,5 +1,7 @@
 # Alpha Private Speaker Connector — Home Assistant
 
+[![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/custom-components/hacs)
+
 Интеграция Home Assistant для умных колонок Alpha / CYBEREX TECH. Связь между колонкой и Home Assistant выполняется по gRPC;
 
 ## Возможности
@@ -103,4 +105,4 @@ logger:
 
 ## Поддержка проекта
 
-Если вам понравился проект и вы хотите его поддержать, просто поставьте звёздочку на GitHub или финансово на карту 5599 0021 0889 4694(ЮMoney). 
+Если вам понравился проект и вы хотите его поддержать, просто поставьте звёздочку на GitHub или финансово на карту 5599 0021 0889 4694 (ЮMoney). 
